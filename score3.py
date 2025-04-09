@@ -350,6 +350,8 @@ def main():
         return
     
     for sectoral_id in index_ids:
+        if sectoral_id == NIFTY50_INDEX_ID or sectoral_id == BSE500_INDEX_ID:
+            continue
         print(f"\nProcessing sectoral ID: {sectoral_id}")
         print("-" * 50)
         process_sectoral_data(sectoral_id)

@@ -32,92 +32,6 @@ def validate_month_year(month, year):
     except ValueError as e:
         raise BadRequest(f"Invalid month or year: {str(e)}")
 
-# Helper function to generate file output
-def generate_file_output(df, file_format, filename_prefix):
-    output = io.BytesIO()
-    if file_format == 'excel':
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name='Sheet1')
-        output.seek(0)
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=f"{filename_prefix}.xlsx"
-        )
-    elif file_format == 'csv':
-        df.to_csv(output, index=False)
-        output.seek(0)
-        return send_file(
-            output,
-            mimetype='text/csv',
-            as_attachment=True,
-            download_name=f"{filename_prefix}.csv"
-        )
-    else:
-        raise BadRequest("Invalid file format. Use 'excel' or 'csv'.")
-
-# Summary API
-@app.route('/api/summary', methods=['GET'])
-def get_summary():
-    try:
-        month = request.args.get('month')
-        year = request.args.get('year')
-        file_format = request.args.get('format', 'json').lower()
-
-        # Validate inputs
-        month, year = validate_month_year(month, year)
-        if file_format not in ['json', 'excel', 'csv']:
-            raise BadRequest("Invalid format. Use 'json', 'excel', or 'csv'.")
-
-        # Connect to database
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Get all sectoral indices
-        cursor.execute("SELECT index_id, index_name FROM indices WHERE index_id IN (SELECT DISTINCT sectoral_index_id FROM b_ratios)")
-        indices = cursor.fetchall()
-        index_map = {row[0]: row[1] for row in indices}
-
-        # Query b_ratios for the specified month and year
-        query = """
-            SELECT sectoral_index_id, close_ratio
-            FROM b_ratios
-            WHERE EXTRACT(MONTH FROM trade_date) = %s
-            AND EXTRACT(YEAR FROM trade_date) = %s
-        """
-        cursor.execute(query, (month, year))
-        ratios = cursor.fetchall()
-
-        # Create a dictionary for the summary row
-        summary_row = {index_map.get(index_id, f"Index_{index_id}"): close_ratio for index_id, close_ratio in ratios}
-        summary_row['month'] = month
-        summary_row['year'] = year
-
-        # Convert to DataFrame
-        df = pd.DataFrame([summary_row])
-
-        # Reorder columns to have month and year first
-        cols = ['month', 'year'] + [col for col in df.columns if col not in ['month', 'year']]
-        df = df[cols]
-
-        # Close database connection
-        cursor.close()
-        conn.close()
-
-        # Return based on format
-        if file_format == 'json':
-            return jsonify(summary_row)
-        else:
-            return generate_file_output(df, file_format, f"summary_{year}_{month}")
-
-    except BadRequest as e:
-        return jsonify({"error": str(e)}), 400
-    except InternalServerError as e:
-        return jsonify({"error": str(e)}), 500
-    except Exception as e:
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
-
 # Top/Bottom Scores API
 @app.route('/api/topbottom_scores', methods=['GET'])
 def get_topbottom_scores():
@@ -276,12 +190,6 @@ def get_topbottom_scores():
         return jsonify({"error": str(e)}), 500
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500 
-
-from flask import Flask, jsonify, request, send_file
-from werkzeug.exceptions import BadRequest, InternalServerError
-import pandas as pd
-import io
-from datetime import datetime
 
 @app.route('/api/topbottom_scores_by_range', methods=['GET'])
 def get_topbottom_scores_by_range():
@@ -461,6 +369,7 @@ def get_ratio_data():
         cursor.execute("""
             SELECT index_id, index_name 
             FROM indices 
+            WHERE index_id != 1 AND index_id != 2
             ORDER BY index_id
         """)
         indices = cursor.fetchall()
@@ -518,6 +427,104 @@ def get_ratio_data():
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
+
+@app.route('/api/ratio_data_by_range', methods=['GET'])
+def get_ratio_data_by_range():
+    try:
+        start_date = request.args.get('start_date')  # Format: YYYY-MM-DD
+        end_date = request.args.get('end_date')      # Format: YYYY-MM-DD
+        ratio_choice = request.args.get('ratio_choice', 'n1').lower()
+        file_format = request.args.get('file_format', 'json').lower()
+
+        # Validate inputs
+        try:
+            start_date = datetime.strptime(start_date, '%Y-%m-%d')
+            end_date = datetime.strptime(end_date, '%Y-%m-%d')
+            if start_date > end_date:
+                raise ValueError("start_date must be before or equal to end_date")
+        except (ValueError, TypeError):
+            raise BadRequest("start_date and end_date must be in YYYY-MM-DD format, and start_date must be <= end_date")
+        
+        valid_ratios = ['n1', 'n2', 'n3', 'b1', 'b2', 'b3']
+        if ratio_choice not in valid_ratios:
+            raise BadRequest(f"Invalid ratio choice. Must be one of {valid_ratios}")
+        if file_format not in ['json', 'excel', 'csv']:
+            raise BadRequest("file_format must be 'json', 'excel', or 'csv'")
+
+        # Determine table name
+        table_name = 'n_ratios' if ratio_choice.startswith('n') else 'b_ratios'
+
+        # Connect to database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Get all indices
+        cursor.execute("""
+            SELECT index_id, index_name 
+            FROM indices 
+            WHERE index_id != 1 AND index_id != 2
+            ORDER BY index_id where index_id IS NOT EQUAL TO 1 AND index_id IS NOT EQUAL TO 2
+        """)
+        indices = cursor.fetchall()
+        index_mapping = {idx[0]: idx[1] for idx in indices}
+
+        # Query data with date range
+        query = f"""
+            SELECT 
+                trade_date,
+                sectoral_index_id,
+                {ratio_choice}
+            FROM {table_name}
+            WHERE {ratio_choice} IS NOT NULL
+            AND trade_date >= %s
+            AND trade_date <= %s
+            ORDER BY trade_date, sectoral_index_id
+        """
+        cursor.execute(query, (start_date, end_date))
+        data = cursor.fetchall()
+
+        # Process data into a dictionary
+        monthly_data = {}
+        for trade_date, index_id, ratio_value in data:
+            date_str = trade_date.strftime('%Y-%m')
+            if date_str not in monthly_data:
+                monthly_data[date_str] = {}
+            monthly_data[date_str][index_id] = ratio_value
+
+        # Create DataFrame
+        dates = sorted(monthly_data.keys())
+        df_data = {'trade_date': dates}
+        for index_id, index_name in index_mapping.items():
+            values = [monthly_data[date].get(index_id, None) for date in dates]
+            df_data[index_name] = values
+
+        df = pd.DataFrame(df_data)
+
+        # Prepare JSON result
+        result = {
+            'start_date': start_date.strftime('%Y-%m-%d'),
+            'end_date': end_date.strftime('%Y-%m-%d'),
+            'ratio_choice': ratio_choice
+        }
+        if df.empty:
+            result['message'] = f"No data found for ratio '{ratio_choice}' between {start_date.strftime('%Y-%m-%d')} and {end_date.strftime('%Y-%m-%d')}"
+        else:
+            result['data'] = {date: {index_mapping[idx]: val for idx, val in monthly_data[date].items()} for date in dates}
+
+        # Close database connection
+        cursor.close()
+        conn.close()
+
+        # Return based on file_format
+        if file_format == 'json':
+            return jsonify(result)
+        else:
+            return generate_file_output(df, file_format, f"monthly_{ratio_choice}_data_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}")
+
+    except BadRequest as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 # Helper function to generate file output
 def generate_file_output(df, file_format, filename_prefix):
     output = io.BytesIO()
